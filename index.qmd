@@ -1,0 +1,12 @@
+---
+title: "Wijdane Kouri"
+---
+
+Hi, I am a Master's student at Baruch College in the STA 9750 course.
+
+```{r}
+#| include: false
+1+1
+```
+--------------
+Last Updated: `r format(Sys.time(), "%A %m %d, %Y at %H:%M%p")`
