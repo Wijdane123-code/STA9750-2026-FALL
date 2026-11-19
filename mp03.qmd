@@ -10,6 +10,7 @@ library(tidyverse)
 library(tidycensus)
 library(sf)
 library(httr2)
+library(gt)
 
 # Folder where all data files for this project are saved
 if (!dir.exists(file.path("data", "mp03"))) {
@@ -48,7 +49,8 @@ tract_file <- file.path("data", "mp03", "nyc_tracts_moroccan.shp")
 if (!file.exists(tract_file)) {
   get_acs(
     geography = "tract",
-    variables = c(total = "B01003_001", moroccan = "B04006_011"),
+    variables = c(total = "B01003_001", moroccan = "B04006_011",
+                  housing = "B25001_001"),
     state = "NY",
     county = c("New York", "Kings", "Queens", "Bronx", "Richmond"),
     year = 2024,
@@ -188,3 +190,128 @@ load_pluto <- function() {
 
 pluto <- load_pluto()
 ```
+### Which tract has the most office space?
+
+```{r}
+#| label: task6-q1-office
+#| message: false
+# Convert PLUTO's tract ID (borough digit + 6-digit tract)
+# to the census GEOID (state 36 + county FIPS + 6-digit tract)
+boro_to_county <- c("1" = "061", "2" = "005", "3" = "047",
+                    "4" = "081", "5" = "085")
+
+pluto <- pluto |>
+  mutate(GEOID = if_else(
+    is.na(bct2020),
+    NA_character_,
+    paste0("36", boro_to_county[str_sub(bct2020, 1, 1)],
+           str_sub(bct2020, 2, 7))
+  ))
+
+# Q1: total office floor area per tract (NA treated as 0, per the hint)
+office_by_tract <- pluto |>
+  filter(!is.na(GEOID)) |>
+  mutate(officearea = replace_na(officearea, 0)) |>
+  group_by(GEOID) |>
+  summarize(office_area = sum(officearea))
+
+top_office <- office_by_tract |>
+  slice_max(office_area, n = 1) |>
+  left_join(
+    tract_nta |> st_drop_geometry() |> select(GEOID, NTAName, BoroName),
+    by = "GEOID"
+  )
+```
+The census tract with the most office space is `r top_office$GEOID`, located in `r top_office$NTAName` in `r top_office$BoroName`, with approximately `r scales::comma(top_office$office_area)` square feet of office space. This makes sense because the area includes the World Trade Center.
+
+### Which neighborhood has the most residential units?
+
+```{r}
+#| label: task6-q2-units
+#| message: false
+# Building totals per tract (reused in later questions)
+pluto_tract <- pluto |>
+  filter(!is.na(GEOID)) |>
+  group_by(GEOID) |>
+  summarize(
+    res_units = sum(unitsres, na.rm = TRUE),
+    res_area  = sum(resarea, na.rm = TRUE),
+    com_area  = sum(comarea, na.rm = TRUE),
+    bldg_area = sum(bldgarea, na.rm = TRUE)
+  )
+
+# Which NTA each tract belongs to, plus its population
+tract_lookup <- tract_nta |>
+  st_drop_geometry() |>
+  select(GEOID, NTA2020, NTAName, BoroName, total, moroccan, housing)
+
+# Q2: residential units per NTA, top 5
+units_by_nta <- pluto_tract |>
+  inner_join(tract_lookup, by = "GEOID") |>
+  group_by(NTAName, BoroName) |>
+  summarize(res_units = sum(res_units), .groups = "drop") |>
+  slice_max(res_units, n = 5)
+
+units_by_nta |>
+  gt() |>
+  tab_header(
+    title = "NYC Neighborhoods with the Most Residential Units",
+    subtitle = "Source: NYC PLUTO"
+  ) |>
+  cols_label(
+    NTAName = "Neighborhood",
+    BoroName = "Borough",
+    res_units = "Residential Units"
+  ) |>
+  fmt_number(res_units, decimals = 0)
+```
+The neighborhood with the highest number of residential units is `r units_by_nta$NTAName[1]`, with `r scales::comma(units_by_nta$res_units[1])` residential units. All five neighborhoods with the most residential units are located in Manhattan.
+
+### Which tract has the highest population density?
+
+```{r}
+#| label: task6-q3-density
+#| message: false
+# Population density per tract, measured two ways
+density_tract <- tract_lookup |>
+  inner_join(pluto_tract, by = "GEOID") |>
+  # Keep clearly residential tracts, and drop tracts where PLUTO's unit
+  # count disagrees with the census housing count (big lots that span tracts)
+  filter(total >= 1000, res_units >= 100, res_area > 0,
+         between(res_units / housing, 0.5, 2)) |>
+  mutate(
+    pop_per_1000_sqft = total / res_area * 1000,
+    pop_per_unit      = total / res_units
+  )
+
+top_by_area <- density_tract |> slice_max(pop_per_1000_sqft, n = 5)
+top_by_unit <- density_tract |> slice_max(pop_per_unit, n = 5)
+
+# Does the densest tract change depending on the measure?
+same_top <- top_by_area$GEOID[1] == top_by_unit$GEOID[1]
+
+bind_rows(
+  "By residential floor area" = top_by_area,
+  "By residential unit"       = top_by_unit,
+  .id = "measure"
+) |>
+  select(measure, GEOID, NTAName, BoroName, total,
+         pop_per_1000_sqft, pop_per_unit) |>
+  gt(groupname_col = "measure") |>
+  tab_header(
+    title = "Most Densely Populated NYC Census Tracts",
+    subtitle = "Top 5 by each density measure | Sources: ACS 2020-2024, NYC PLUTO"
+  ) |>
+  cols_label(
+    GEOID = "Tract",
+    NTAName = "Neighborhood",
+    BoroName = "Borough",
+    total = "Population",
+    pop_per_1000_sqft = "People per 1,000 sq ft",
+    pop_per_unit = "People per Unit"
+  ) |>
+  fmt_number(total, decimals = 0) |>
+  fmt_number(c(pop_per_1000_sqft, pop_per_unit), decimals = 2)
+```
+
+The highest density by floor area is in r top_by_area$NTAName[1], tract r top_by_area$GEOID[1], with r round(top_by_area$pop_per_1000_sqft[1], 2) people per 1,000 square feet. By residential unit, the densest neighborhood is r top_by_unit$NTAName[1], with r round(top_by_unit$pop_per_unit[1], 2) people per unit. This shows that the answer changes depending on the measurement used. I compared r nrow(density_tract) tracts after removing very small tracts and tracts where PLUTO's residential unit counts did not match the census counts, because large properties can cross tract boundaries.
