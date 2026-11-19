@@ -1,7 +1,190 @@
+---
+title: "Where My People At? Moroccan-Americans in NYC and the US"
+---
 
-  ---
-  title: "Mini-Project Placeholder"
-  ---
-  
-  This is a placeholder for STA9750 Mini-Project 3. Check back soon for more!
-  
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(httr2)
+
+# Folder where all data files for this project are saved
+if (!dir.exists(file.path("data", "mp03"))) {
+  dir.create(file.path("data", "mp03"), recursive = TRUE)
+}
+```
+
+```{r}
+#| label: task1-cbsa
+#| message: false
+# Task 1: metro-area (CBSA) total and Moroccan population, latest ACS-1
+# Downloads only if the file isn't saved yet (caching)
+cbsa_file <- file.path("data", "mp03", "cbsa_moroccan.shp")
+
+if (!file.exists(cbsa_file)) {
+  get_acs(
+    geography = "cbsa",
+    variables = c(total = "B01003_001", moroccan = "B04006_011"),
+    year = 2025,
+    survey = "acs1",
+    geometry = TRUE
+  ) |>
+    write_sf(cbsa_file)
+}
+
+cbsa_pop <- read_sf(cbsa_file)
+```
+
+```{r}
+#| label: task2-tracts
+#| message: false
+# Task 2: NYC census tract total and Moroccan population, latest ACS-5
+# The 5 NYC counties = the 5 boroughs
+tract_file <- file.path("data", "mp03", "nyc_tracts_moroccan.shp")
+
+if (!file.exists(tract_file)) {
+  get_acs(
+    geography = "tract",
+    variables = c(total = "B01003_001", moroccan = "B04006_011"),
+    state = "NY",
+    county = c("New York", "Kings", "Queens", "Bronx", "Richmond"),
+    year = 2024,
+    survey = "acs5",
+    geometry = TRUE
+  ) |>
+    write_sf(tract_file)
+}
+
+nyc_tracts <- read_sf(tract_file)
+```
+
+```{r}
+#| label: task3-nta
+#| message: false
+# Task 3: download, unzip and read NYC's 2020 Neighborhood Tabulation Areas
+load_nyc_nta <- function() {
+  data_dir <- file.path("data", "mp03")
+  if (!dir.exists(data_dir)) {
+    dir.create(data_dir, recursive = TRUE)
+  }
+
+  nta_url <- paste0(
+    "https://s-media.nyc.gov/agencies/dcp/assets/files/zip/data-tools/",
+    "bytes/neighborhood-tabulation-areas/nynta2020_26d.zip"
+  )
+  zip_file <- file.path(data_dir, "nyc_nta_2020.zip")
+  nta_dir  <- file.path(data_dir, "nyc_nta_2020")
+
+  # Download only if we don't already have the zip (caching)
+  if (!file.exists(zip_file)) {
+    download.file(nta_url, destfile = zip_file, mode = "wb")
+  }
+
+  # Unzip only once
+  if (!dir.exists(nta_dir)) {
+    unzip(zip_file, exdir = nta_dir)
+  }
+
+  # Find the .shp file inside the unzipped folder and read it
+  shp_file <- list.files(nta_dir, pattern = "\\.shp$",
+                         recursive = TRUE, full.names = TRUE)[1]
+
+  # Keep only the columns we need
+  read_sf(shp_file) |>
+    select(NTA2020, NTAName, BoroName, NTAType)
+}
+
+nyc_nta <- load_nyc_nta()
+```
+```{r}
+#| label: task4-aggregate
+#| message: false
+#| warning: false
+# Task 4: aggregate tract populations up to NTAs (neighborhoods)
+
+# 1. One row per tract, with 'total' and 'moroccan' as columns
+tract_counts <- nyc_tracts |>
+  st_drop_geometry() |>
+  select(GEOID, variable, estimate) |>
+  pivot_wider(names_from = variable, values_from = estimate)
+
+# 2. Attach the tract shapes, drop empty (water) shapes,
+#    and convert to the same coordinate system as the NTA map
+nyc_tracts_wide <- nyc_tracts |>
+  filter(variable == "total") |>
+  select(GEOID, geometry) |>
+  left_join(tract_counts, by = "GEOID") |>
+  filter(!st_is_empty(geometry)) |>
+  st_transform(st_crs(nyc_nta))
+
+# 3. Spatial join: each tract goes to the NTA it overlaps most
+tract_nta <- st_join(nyc_tracts_wide, nyc_nta, largest = TRUE)
+
+# 4. Drop shapes, add up people per NTA
+nta_counts <- tract_nta |>
+  st_drop_geometry() |>
+  group_by(NTA2020) |>
+  summarize(
+    total    = sum(total, na.rm = TRUE),
+    moroccan = sum(moroccan, na.rm = TRUE),
+    n_tracts = n()
+  )
+
+# 5. Reconnect the totals to the NTA shapes
+nyc_nta_pop <- nyc_nta |>
+  left_join(nta_counts, by = "NTA2020") |>
+  mutate(pct_moroccan = if_else(total > 0, moroccan / total, NA_real_))
+```
+
+```{r}
+#| label: task5-pluto
+#| message: false
+# Task 5: download NYC PLUTO page by page through the SODA2 API (cached)
+load_pluto <- function() {
+  pluto_file <- file.path("data", "mp03", "pluto.csv")
+
+  if (!file.exists(pluto_file)) {
+    base_url  <- "https://data.cityofnewyork.us/resource/64uk-42ks.csv"
+    page_size <- 50000
+    offset    <- 0
+    pages     <- list()
+
+    repeat {
+      page <- request(base_url) |>
+        req_url_query(
+          `$select` = paste(
+            "bbl,borough,bct2020,landuse,unitsres,resarea,",
+            "officearea,comarea,bldgarea,numfloors",
+            sep = ""
+          ),
+          `$order`  = "bbl",
+          `$limit`  = page_size,
+          `$offset` = offset
+        ) |>
+        req_perform() |>
+        resp_body_string() |>
+        I() |>
+        read_csv(col_types = cols(.default = col_character()))
+      
+      pages[[length(pages) + 1]] <- page
+
+      # A short page means we reached the end of the data
+      if (nrow(page) < page_size) break
+      offset <- offset + page_size
+    }
+
+    bind_rows(pages) |>
+      write_csv(pluto_file)
+  }
+
+  read_csv(pluto_file,
+           col_types = cols(bbl = col_character(),
+                            bct2020 = col_character(),
+                            .default = col_guess()))
+}
+
+pluto <- load_pluto()
+```
