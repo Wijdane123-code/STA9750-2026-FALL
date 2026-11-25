@@ -2,6 +2,12 @@
 title: "Where My People At? Moroccan-Americans in NYC and the US"
 ---
 
+### Introduction
+
+This report is part of *Welcomed by the New Colossus: An Atlas of American Communities*, and my entry focuses on Moroccan-Americans. The goal is to explore where Moroccan-Americans live within New York City and where they are most concentrated across the United States. To do this, I used three main sources: the American Community Survey (ACS) from the U.S. Census Bureau for population and ancestry information, NYC's Neighborhood Tabulation Areas for official neighborhood boundaries, and NYC PLUTO, the city's building database, for information about housing, office space, and building heights.
+
+The report first covers the data-loading process, followed by several exploratory questions about New York City's population and housing. It then presents the Atlas entry, using maps and population data to show where Moroccan-Americans live in NYC and across the country. One interesting finding is that the Washington, DC metropolitan area has a slightly larger Moroccan-American population than the New York metropolitan area.
+
 ```{r}
 #| label: setup
 #| message: false
@@ -17,6 +23,10 @@ if (!dir.exists(file.path("data", "mp03"))) {
   dir.create(file.path("data", "mp03"), recursive = TRUE)
 }
 ```
+
+## Data Acquisition
+
+The next section downloads ACS population and ancestry data, NYC neighborhood boundaries, and PLUTO building data, which are cached so they can be reused without downloading them again every time the code runs.
 
 ```{r}
 #| label: task1-cbsa
@@ -314,4 +324,429 @@ bind_rows(
   fmt_number(c(pop_per_1000_sqft, pop_per_unit), decimals = 2)
 ```
 
-The highest density by floor area is in r top_by_area$NTAName[1], tract r top_by_area$GEOID[1], with r round(top_by_area$pop_per_1000_sqft[1], 2) people per 1,000 square feet. By residential unit, the densest neighborhood is r top_by_unit$NTAName[1], with r round(top_by_unit$pop_per_unit[1], 2) people per unit. This shows that the answer changes depending on the measurement used. I compared r nrow(density_tract) tracts after removing very small tracts and tracts where PLUTO's residential unit counts did not match the census counts, because large properties can cross tract boundaries.
+The highest density by floor area is in `r top_by_area$NTAName[1]`, tract `r top_by_area$GEOID[1]`, with `r round(top_by_area$pop_per_1000_sqft[1], 2)` people per 1,000 square feet. By residential unit, the densest neighborhood is `r top_by_unit$NTAName[1]`, with `r round(top_by_unit$pop_per_unit[1], 2)` people per unit. This shows that the answer changes depending on the measurement used. I compared `r nrow(density_tract)` tracts after removing very small tracts and tracts where PLUTO's residential unit counts did not match the census counts, because large properties can cross tract boundaries.
+
+## Which metro areas have the largest Moroccan share?
+
+```{r}
+# Q4: Moroccan share of each metro area's population
+# One row per metro, with 'total' and 'moroccan' as columns
+cbsa_wide <- cbsa_pop |>
+  st_drop_geometry() |>
+  select(GEOID, NAME, variable, estimate) |>
+  pivot_wider(names_from = variable, values_from = estimate) |>
+  filter(!is.na(moroccan), total > 0) |>
+  mutate(pct_moroccan = moroccan / total)
+
+# NYC metro, kept separately for comparison
+nyc_metro <- cbsa_wide |>
+  filter(str_detect(NAME, "New York-Newark"))
+
+# Top 5 metros other than NYC
+# Small counts are very noisy in a one-year survey, so require
+# at least 1,000 Moroccan residents
+top_metros <- cbsa_wide |>
+  filter(!str_detect(NAME, "New York-Newark"), moroccan >= 1000) |>
+  slice_max(pct_moroccan, n = 5)
+
+top_metros |>
+  select(NAME, total, moroccan, pct_moroccan) |>
+  gt() |>
+  tab_header(
+    title = "Metro Areas with the Largest Moroccan-American Share",
+    subtitle = "Excluding the New York metro | Source: ACS 2025 1-year"
+  ) |>
+  cols_label(
+    NAME = "Metro Area",
+    total = "Total Population",
+    moroccan = "Moroccan-American",
+    pct_moroccan = "Share"
+  ) |>
+  fmt_number(c(total, moroccan), decimals = 0) |>
+  fmt_percent(pct_moroccan, decimals = 2)
+```
+
+Outside the New York metro area, Washington-Arlington-Alexandria has the highest Moroccan-American share, at `r scales::percent(top_metros$pct_moroccan[1], accuracy = 0.01)`, representing `r scales::comma(top_metros$moroccan[1])` Moroccan Americans. I used a cutoff of at least 1,000 Moroccan Americans to avoid including smaller metro areas where the percentages may be less reliable. For comparison, the New York metro area's Moroccan-American share is `r scales::percent(nyc_metro$pct_moroccan, accuracy = 0.01)`.
+
+## What is the ancestry mix in the Washington, DC metro?
+```{r}
+#| fig-width: 9
+# Q5: all ancestry groups (table B04006) for the Washington DC metro
+dc_file <- file.path("data", "mp03", "dc_ancestry.csv")
+
+if (!file.exists(dc_file)) {
+  # Readable labels for each B04006 variable
+  ancestry_labels <- load_variables(2025, "acs1") |>
+    filter(str_starts(name, "B04006_")) |>
+    select(variable = name, label)
+
+  get_acs(
+    geography = "cbsa",
+    table = "B04006",
+    year = 2025,
+    survey = "acs1"
+  ) |>
+    filter(str_detect(NAME, "^Washington-Arlington")) |>
+    left_join(ancestry_labels, by = "variable") |>
+    write_csv(dc_file)
+}
+
+dc_ancestry <- read_csv(dc_file, show_col_types = FALSE)
+
+# Keep broad groups only (e.g. "Irish", "Arab"), not sub-groups
+# like "Arab:!!Moroccan", so nobody is counted twice
+dc_top <- dc_ancestry |>
+  filter(str_count(label, "!!") == 2) |>
+  mutate(ancestry = label |>
+           str_remove("^Estimate!!Total:!!") |>
+           str_remove(":$")) |>
+  # Drop catch-all categories that aren't real ancestries
+  filter(!ancestry %in% c("Other groups", "Unclassified or not reported")) |>
+  # Top 12, plus Arab so our group is always shown
+  filter(rank(-estimate) <= 12 | ancestry == "Arab")
+
+ggplot(dc_top,
+       aes(x = estimate,
+           y = fct_reorder(ancestry, estimate),
+           fill = ancestry == "Arab")) +
+  geom_col() +
+  scale_x_continuous(labels = scales::comma) +
+  scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#C1272D"),
+                    guide = "none") +
+  labs(
+    title = "Most Common Ancestries in the Washington, DC Metro",
+    subtitle = "Top 12 broad ancestry groups, with Arab (incl. Moroccan) highlighted",
+    x = "People reporting this ancestry",
+    y = NULL,
+    caption = "Source: ACS 2025 1-year, table B04006. Respondents may report up to two ancestries."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title.position = "plot")
+```
+The largest ancestry groups in the Washington, DC metro area are German, Irish, and English. Arab ranks 11th among the top 12 groups, just ahead of French, with approximately `r scales::comma(dc_top$estimate[dc_top$ancestry == "Arab"])` people reporting Arab ancestry. The numbers may overlap because people can report two ancestries, so one person can be counted in more than one group.
+
+## Where do Moroccan-Americans live across the US?
+
+```{r}
+#| message: false
+# Q6: national total of Moroccan-Americans (denominator), cached
+us_file <- file.path("data", "mp03", "us_moroccan.csv")
+
+if (!file.exists(us_file)) {
+  get_acs(
+    geography = "us",
+    variables = c(total = "B01003_001", moroccan = "B04006_011"),
+    year = 2025,
+    survey = "acs1"
+  ) |>
+    write_csv(us_file)
+}
+
+us_moroccan <- read_csv(us_file, show_col_types = FALSE) |>
+  filter(variable == "moroccan") |>
+  pull(estimate)
+
+# Each metro's share of ALL Moroccan-Americans in the US
+metro_share <- cbsa_wide |>
+  mutate(
+    metro = str_remove(NAME, " Metro Area"),
+    share_of_us = moroccan / us_moroccan
+  ) |>
+  arrange(desc(moroccan)) |>
+  mutate(cumulative_share = cumsum(share_of_us))
+
+# Values for the text
+ny_share    <- metro_share |>
+  filter(str_detect(NAME, "New York-Newark")) |>
+  pull(share_of_us)
+top10_share <- metro_share$cumulative_share[10]
+
+metro_share |>
+  slice_head(n = 10) |>
+  select(metro, moroccan, share_of_us, cumulative_share) |>
+  gt() |>
+  tab_header(
+    title = "Where Moroccan-Americans Live",
+    subtitle = "10 metro areas with the most Moroccan-American residents | Source: ACS 2025 1-year"
+  ) |>
+  cols_label(
+    metro = "Metro Area",
+    moroccan = "Moroccan-Americans",
+    share_of_us = "Share of US Total",
+    cumulative_share = "Cumulative Share"
+  ) |>
+  fmt_number(moroccan, decimals = 0) |>
+  fmt_percent(c(share_of_us, cumulative_share), decimals = 1)
+```
+
+There are `r scales::comma(us_moroccan)` Moroccan-Americans across the United States. Surprisingly, the Washington, DC metro area has more Moroccan-Americans (`r scales::comma(metro_share$moroccan[1])`) than the New York metro area (`r scales::comma(metro_share$moroccan[2])`). The New York metro accounts for `r scales::percent(ny_share, accuracy = 0.1)` of the total, while the top 10 metro areas together account for `r scales::percent(top10_share, accuracy = 0.1)`, showing that more than half of the Moroccan-American population is concentrated in these areas. 
+
+## Is the relationship between population and housing linear?
+
+```{r}
+#| message: false
+#| fig-width: 9
+# Q7: tract population vs. residential units, all NYC tracts with housing
+pop_housing <- tract_lookup |>
+  inner_join(pluto_tract, by = "GEOID") |>
+  filter(total > 0, res_units > 0)
+
+# Correlation for the text
+pop_units_cor <- cor(pop_housing$total, pop_housing$res_units)
+
+ggplot(pop_housing, aes(x = res_units, y = total)) +
+  geom_point(aes(color = BoroName), alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "#C1272D") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Population vs. Residential Units in NYC Census Tracts",
+    subtitle = "Dashed line = straight-line fit; red line = flexible (loess) fit",
+    x = "Residential units (PLUTO)",
+    y = "Population (ACS 2020-2024)",
+    color = "Borough",
+    caption = "Sources: ACS 2020-2024 5-year; NYC PLUTO"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title.position = "plot")
+```
+
+The relationship between population and residential units is positive but more complex than a straight line. The correlation is `r round(pop_units_cor, 2)`, showing a positive relationship between the two variables. However, the red curve starts flattening around 4,000–5,000 units and reaches its peak near 7,000 units. There are only a few census tracts with more than 8,000 units, so the downward trend at the far right should be interpreted carefully.
+
+## Which neighborhoods have the tallest buildings?
+
+```{r}
+# Q8: building height (number of floors) by NTA
+floors_by_nta <- pluto |>
+  filter(!is.na(GEOID), numfloors > 0) |>
+  inner_join(tract_lookup |> select(GEOID, NTAName, BoroName),
+             by = "GEOID") |>
+  group_by(NTAName, BoroName) |>
+  summarize(
+    n_buildings = n(),
+    avg_floors  = mean(numfloors),
+    max_floors  = max(numfloors),
+    .groups = "drop"
+  ) |>
+  # Ignore NTAs with very few buildings (parks, airports, etc.)
+  filter(n_buildings >= 50) |>
+  slice_max(avg_floors, n = 10)
+
+floors_by_nta |>
+  gt() |>
+  tab_header(
+    title = "NYC Neighborhoods with the Tallest Buildings",
+    subtitle = "Top 10 by average number of floors | Source: NYC PLUTO"
+  ) |>
+  cols_label(
+    NTAName = "Neighborhood",
+    BoroName = "Borough",
+    n_buildings = "Buildings",
+    avg_floors = "Average Floors",
+    max_floors = "Tallest Building (Floors)"
+  ) |>
+  fmt_number(n_buildings, decimals = 0) |>
+  fmt_number(avg_floors, decimals = 1) |>
+  fmt_number(max_floors, decimals = 0)
+```
+The Financial District-Battery Park City has the highest average building height, with `r round(floors_by_nta$avg_floors[1], 1)` floors on average. All 10 neighborhoods in the table are located in Manhattan, showing that the tallest buildings are concentrated in this borough. The tallest building in the Financial District has 104 floors, matching One World Trade Center, while Midtown South has a 102-floor building, matching the Empire State Building.
+
+## How does population density vary across NYC?
+
+```{r}
+#| fig-width: 9
+#| fig-height: 9
+# Q9: people per square mile in each NTA
+# Non-residential NTAs (parks, cemeteries, airports) are greyed out,
+# since their density would be misleadingly close to zero
+nta_density <- nyc_nta_pop |>
+  mutate(
+    area_sq_mi = as.numeric(units::set_units(st_area(geometry), "mi^2")),
+    density = if_else(as.character(NTAType) == "0",
+                      total / area_sq_mi, NA_real_)
+  )
+
+# Densest neighborhood, for the text
+densest_nta <- nta_density |>
+  st_drop_geometry() |>
+  slice_max(density, n = 1)
+
+ggplot(nta_density) +
+  geom_sf(aes(fill = density), color = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "magma", direction = -1,
+    labels = scales::comma,
+    na.value = "grey85",
+    name = "People per\nsquare mile"
+  ) +
+  labs(
+    title = "Population Density Across NYC Neighborhoods",
+    subtitle = "Grey = parks, cemeteries, airports and other non-residential areas",
+    caption = "Sources: ACS 2020-2024 5-year; NYC 2020 Neighborhood Tabulation Areas"
+  ) +
+  theme_void(base_size = 13) +
+  theme(plot.title.position = "plot")
+```
+
+The map shows that population density varies across NYC neighborhoods, with the highest density found in `r densest_nta$NTAName`, at `r scales::comma(densest_nta$density)` people per square mile. Manhattan, parts of the Bronx, and central Brooklyn have some of the darkest areas, while Staten Island and eastern Queens are generally less dense. Parks, airports, and other non-residential areas are shown in grey because they are excluded from the density calculation.
+
+## How many New Yorkers live in primarily commercial areas?
+
+```{r}
+# Q10: share of each tract's floor space that is commercial
+# (commercial area / (commercial + residential area), from PLUTO)
+commercial_tracts <- tract_lookup |>
+  inner_join(pluto_tract, by = "GEOID") |>
+  filter(com_area + res_area > 0) |>
+  mutate(com_share = com_area / (com_area + res_area))
+
+nyc_total_pop <- sum(tract_lookup$total, na.rm = TRUE)
+
+# How the answer changes with the definition of "primarily commercial"
+commercial_by_cutoff <- map_dfr(c(0.50, 0.60, 0.75), \(cut) {
+  commercial_tracts |>
+    summarize(
+      cutoff     = cut,
+      tracts     = sum(com_share > cut),
+      population = sum(total[com_share > cut], na.rm = TRUE)
+    )
+}) |>
+  mutate(share = population / nyc_total_pop)
+
+commercial_by_cutoff |>
+  gt() |>
+  tab_header(
+    title = "New Yorkers Living in Primarily Commercial Tracts",
+    subtitle = "Under different definitions of 'primarily commercial' | Sources: ACS 2020-2024, NYC PLUTO"
+  ) |>
+  cols_label(
+    cutoff = "Commercial Share of Floor Area Above",
+    tracts = "Tracts",
+    population = "Residents",
+    share = "Share of NYC Population"
+  ) |>
+  fmt_percent(cutoff, decimals = 0) |>
+  fmt_number(c(tracts, population), decimals = 0) |>
+  fmt_percent(share, decimals = 1)
+```
+
+The results show that the number of New Yorkers living in primarily commercial tracts depends on the cutoff used. When commercial floor area is above 50%, `r scales::comma(commercial_by_cutoff$population[1])` residents are included, representing `r scales::percent(commercial_by_cutoff$share[1], accuracy = 0.1)` of NYC's population. However, using a 75% cutoff reduces the number to `r scales::comma(commercial_by_cutoff$population[3])` residents, showing how much the definition can change the results.
+
+## Atlas Entry: Moroccan-Americans
+
+### Introduction
+
+Morocco and the United States have a long history of diplomatic relations that dates back to the American Revolution. In 1777, Morocco became one of the first countries to recognize the independence of the United States, when Sultan Mohammed III opened Moroccan ports to American ships. This relationship became more formal in 1786, when the two countries signed the Treaty of Peace and Friendship. This treaty established an important foundation for the relationship between the two countries and remains the oldest unbroken treaty relationship in U.S. history (U.S. Department of State, 2022). Although the relationship between the countries goes back centuries, Moroccan immigration to the United States increased more significantly during the later decades of the 20th century and into the 21st century. A 2024 study published by Hofstra University estimated that approximately 140,000 Moroccan-born people and their children lived in the United States in 2022, nearly twice the estimated population in 2010. The study also identifies the Diversity Visa program, established in 1990, as one factor that contributed to this growth (Hofstra University, 2024). The ACS data used in this project estimates a smaller population of approximately 120,000 people reporting Moroccan ancestry. These figures measure different populations: the Hofstra estimate includes Moroccan-born people and their children, while the ACS figure is based on reported ancestry. Together, they provide context for understanding the growth and geographic distribution of Moroccan-American communities throughout the country.
+
+```{r}
+#| fig-width: 9
+#| fig-height: 9
+# Moroccan-American share of each NYC neighborhood
+# (non-residential NTAs greyed out, as in the density map)
+nyc_nta_pop |>
+  mutate(pct_moroccan = if_else(as.character(NTAType) == "0",
+                                pct_moroccan, NA_real_)) |>
+  ggplot() +
+  geom_sf(aes(fill = pct_moroccan), color = "white", linewidth = 0.1) +
+  scale_fill_distiller(
+    palette = "Reds", direction = 1,
+    labels = scales::percent,
+    na.value = "grey85",
+    name = "Moroccan-American\nshare of residents"
+  ) +
+  labs(
+    title = "Where Moroccan-Americans Live in New York City",
+    subtitle = "Share of each neighborhood's residents reporting Moroccan ancestry",
+    caption = "Sources: ACS 2020-2024 5-year, table B04006; NYC 2020 NTAs"
+  ) +
+  theme_void(base_size = 13) +
+  theme(plot.title.position = "plot")
+```
+
+```{r}
+# NYC neighborhoods with the most Moroccan-American residents
+top_moroccan_nta <- nyc_nta_pop |>
+  st_drop_geometry() |>
+  filter(total >= 1000) |>
+  slice_max(moroccan, n = 5)
+
+top_moroccan_nta |>
+  select(NTAName, BoroName, moroccan, pct_moroccan) |>
+  gt() |>
+  tab_header(
+    title = "NYC Neighborhoods with the Most Moroccan-Americans",
+    subtitle = "Source: ACS 2020-2024 5-year"
+  ) |>
+  cols_label(
+    NTAName = "Neighborhood",
+    BoroName = "Borough",
+    moroccan = "Moroccan-Americans",
+    pct_moroccan = "Share of Residents"
+  ) |>
+  fmt_number(moroccan, decimals = 0) |>
+  fmt_percent(pct_moroccan, decimals = 1)
+```
+
+### NYC Findings
+
+New York City has an especially visible Moroccan-American presence, and the neighborhood map shows that this population is not distributed evenly across the five boroughs. The strongest concentration appears in southwest Brooklyn, where five neighboring areas stand out: Bensonhurst, Bay Ridge, Gravesend (West), Bath Beach, and Dyker Heights. Together, these five neighborhoods account for `r scales::comma(sum(top_moroccan_nta$moroccan))` residents reporting Moroccan ancestry. Bensonhurst has the largest population, with 853 Moroccan-Americans, followed by Bay Ridge with 724 and Gravesend (West) with 456. Bath Beach has a smaller population of 386, but it has the highest percentage of Moroccan-American residents among these five neighborhoods, at 1.3%. Dyker Heights follows with 358 residents. These results show why looking at both population counts and percentages is important. A neighborhood can have fewer Moroccan-American residents overall but still have a higher share of its total population reporting Moroccan ancestry. Bay Ridge also provides interesting historical context because it is home to one of New York City's largest Arab-American communities. According to the NYC Department of Small Business Services, approximately 10% of Bay Ridge residents report Arab ancestry. The neighborhood has developed into an important center for Arab-American residents, businesses, and cultural organizations. Although Arab-American and Moroccan-American populations are not interchangeable, this history helps explain the broader cultural environment in which Moroccan-American residents live today.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6.5
+#| warning: false
+# All metros as a grey background (even those with no Moroccan count),
+# continental US only, in an equal-area projection
+us_metros <- cbsa_pop |>
+  filter(variable == "total") |>
+  select(GEOID, NAME, geometry) |>
+  left_join(cbsa_wide |> select(GEOID, moroccan, pct_moroccan),
+            by = "GEOID") |>
+  filter(!str_detect(NAME, ", (AK|HI|PR)")) |>
+  st_transform(5070)
+
+# One dot per metro with a Moroccan count, sized by count;
+# big dots drawn first so small ones stay visible on top
+metro_points <- us_metros |>
+  filter(!is.na(moroccan), moroccan > 0) |>
+  arrange(desc(moroccan)) |>
+  st_centroid()
+
+ggplot() +
+  geom_sf(data = us_metros, fill = "grey88", color = "white", linewidth = 0.1) +
+  geom_sf(data = metro_points,
+          aes(size = moroccan, color = pct_moroccan), alpha = 0.8) +
+  scale_size_area(max_size = 14, labels = scales::comma,
+                  name = "Moroccan-Americans") +
+  scale_color_distiller(palette = "Reds", direction = 1,
+                        labels = scales::percent,
+                        name = "Share of metro\npopulation") +
+  labs(
+    title = "Moroccan-Americans Across US Metro Areas",
+    subtitle = "Dot size = number of residents; color = share of the metro population",
+    caption = "Source: ACS 2025 1-year, table B04006. Grey shapes are metro areas; metros without a dot have no published estimate."
+  ) +
+  theme_void(base_size = 13) +
+  theme(plot.title.position = "plot")
+```
+
+### U.S. Findings
+
+Looking beyond New York City, the national map shows that Moroccan-Americans are concentrated mainly along the East Coast, particularly around Boston, New York, and Washington, DC. According to the ACS data, approximately `r scales::comma(us_moroccan)` people across the United States report Moroccan ancestry. The ten largest metropolitan areas account for `r scales::percent(top10_share, accuracy = 0.1)` of this population, showing that a substantial portion of Moroccan-Americans live in a relatively small number of metropolitan areas. One particularly interesting finding is the comparison between Washington, DC and New York. Surprisingly, the Washington-Arlington metropolitan area has the larger Moroccan-American population, with 14,820 residents, compared with 14,292 in the New York-Newark metropolitan area. Although New York is often associated with large immigrant communities, these results show that Washington, DC actually has a slightly higher concentration of residents reporting Moroccan ancestry in this dataset. Outside the Northeast, the map also identifies smaller concentrations in Florida, especially Orlando and Miami, as well as Chicago and Atlanta. In contrast, much of the western United States has relatively few visible dots, suggesting that Moroccan-American populations are more geographically concentrated in certain metropolitan areas rather than evenly distributed across the country. This pattern is consistent with the 2024 Hofstra University study, which identifies New York City, Boston, and Washington, DC as particularly important centers of Moroccan-American settlement. Overall, the national map highlights the importance of the East Coast corridor while also showing that Moroccan-American communities have developed in several other regions of the country.
+
+### Conclusion 
+
+Overall, these maps show that Moroccan-Americans have established communities throughout the United States, but their distribution is far from uniform. While the East Coast contains several of the largest metropolitan concentrations, Washington, DC stands out by having a slightly larger Moroccan-American population than New York. At the neighborhood level, southwest Brooklyn provides an even closer look at how these communities are distributed within New York City. Together, the maps demonstrate how census data can reveal both national migration patterns and smaller neighborhood communities that might otherwise be overlooked.
+
+### Sources
+
+- [U.S. Department of State – U.S.-Morocco Relations](https://2021-2025.state.gov/u-s-relations-with-morocco/)
+- [Hofstra University (2024) – The Moroccan Diaspora in the United States](https://news.hofstra.edu/2024/05/12/the-moroccan-diaspora-in-the-united-states-how-much-political-engagement-2/)
+- [NYC Department of Small Business Services – Bay Ridge Commercial District Needs Assessment](https://www.nyc.gov/assets/sbs/downloads/pdf/neighborhoods/avenyc-cdna-bayridge.pdf)
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+
+I used AI to help with most of the R code for Q4–Q10, including the maps and neighborhood table. I ran the code myself and used AI to understand errors and fix syntax. For the writing, I used AI for ideas. I chose the topic, worked with the data, and found and checked the sources myself.
+
+:::
